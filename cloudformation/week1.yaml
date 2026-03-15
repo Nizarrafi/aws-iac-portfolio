@@ -1,0 +1,270 @@
+# Specifies the CloudFormation template format version
+AWSTemplateFormatVersion: '2010-09-09'
+
+# General description of the stack
+Description: 'Demo VPC with Public & Private EC2'
+
+Parameters:
+  # Parameter to define the EC2 KeyPair used for SSH access
+  KeyName:
+    Type: String
+    Default: Keypair-demoweek1
+    Description: EC2 KeyPair
+
+Resources:
+
+  # =========================================================
+  # 1. VPC
+  # =========================================================
+  # Creates a Virtual Private Cloud (VPC)
+  w1VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      # Main CIDR block for the VPC
+      CidrBlock: 10.10.0.0/16
+
+      # Enables DNS resolution inside the VPC
+      EnableDnsSupport: true
+
+      # Enables DNS hostnames for EC2 instances
+      EnableDnsHostnames: true
+
+      Tags:
+        # Name tag for the VPC
+        - Key: Name
+          Value: w1-vpc
+
+  # =========================================================
+  # 2. Internet Gateway
+  # =========================================================
+  # Internet Gateway to allow internet access
+  w1IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: w1-igw
+
+  # Attaches the Internet Gateway to the VPC
+  w1IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref w1VPC
+      InternetGatewayId: !Ref w1IGW
+
+  # =========================================================
+  # 3. Subnets
+  # =========================================================
+  # Public subnet for internet-facing resources
+  w1PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      # Specifies the VPC for this subnet
+      VpcId: !Ref w1VPC
+
+      # CIDR block for the public subnet
+      CidrBlock: 10.10.1.0/24
+
+      # Uses the first available Availability Zone
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+      # Automatically assigns public IPs to instances
+      MapPublicIpOnLaunch: true
+
+      Tags:
+        - Key: Name
+          Value: w1-public-subnet
+
+  # Private subnet for internal resources
+  w1PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref w1VPC
+
+      # CIDR block for the private subnet
+      CidrBlock: 10.10.2.0/24
+
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+      Tags:
+        - Key: Name
+          Value: w1-private-subnet
+
+  # =========================================================
+  # 4. Route Tables
+  # =========================================================
+  # Route table for the public subnet
+  w1PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref w1VPC
+      Tags:
+        - Key: Name
+          Value: w1-public-rt
+
+  # Default route to the Internet Gateway
+  w1PublicRoute:
+    Type: AWS::EC2::Route
+
+    # Ensures the Internet Gateway is attached first
+    DependsOn: w1IGWAttach
+    Properties:
+      RouteTableId: !Ref w1PublicRT
+
+      # Routes all outbound traffic
+      DestinationCidrBlock: 0.0.0.0/0
+
+      # Sends traffic to the Internet Gateway
+      GatewayId: !Ref w1IGW
+
+  # Associates the public subnet with the public route table
+  w1PublicRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref w1PublicSubnet
+      RouteTableId: !Ref w1PublicRT
+
+  # =========================================================
+  # 5. NAT Gateway (for private subnet internet access)
+  # =========================================================
+  # Elastic IP required by the NAT Gateway
+  w1NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: w1IGWAttach
+    Properties:
+      Domain: vpc
+
+  # NAT Gateway placed in the public subnet
+  w1NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      # Uses the allocated Elastic IP
+      AllocationId: !GetAtt w1NatEIP.AllocationId
+
+      # NAT Gateway must be in a public subnet
+      SubnetId: !Ref w1PublicSubnet
+
+      Tags:
+        - Key: Name
+          Value: w1-nat-gw
+
+  # Route table for the private subnet
+  w1PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref w1VPC
+      Tags:
+        - Key: Name
+          Value: w1-private-rt
+
+  # Routes private subnet traffic through NAT Gateway
+  w1PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref w1PrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref w1NatGateway
+
+  # Associates the private subnet with the private route table
+  w1PrivateRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref w1PrivateSubnet
+      RouteTableId: !Ref w1PrivateRT
+
+  # =========================================================
+  # 6. Security Groups
+  # =========================================================
+  # Security group for public EC2 instance
+  w1PublicSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public EC2 Security Group
+      VpcId: !Ref w1VPC
+      SecurityGroupIngress:
+        # Allows HTTP access from anywhere
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+        # Allows SSH only from a specific IP
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 103.175.48.92/32
+      SecurityGroupEgress:
+        # Allows all outbound traffic
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # Security group for private EC2 instance
+  w1PrivateSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private EC2 Security Group
+      VpcId: !Ref w1VPC
+      SecurityGroupIngress:
+        # Allows SSH only from the public EC2
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref w1PublicSG
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # =========================================================
+  # 7. EC2 Instances
+  # =========================================================
+  # Public EC2 instance with internet access
+  w1PublicEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      # Instance type
+      InstanceType: t3.micro
+
+      # SSH KeyPair
+      KeyName: !Ref KeyName
+
+      # Amazon Linux AMI
+      ImageId: ami-04dd8f0d80ed6323e
+
+      SubnetId: !Ref w1PublicSubnet
+      SecurityGroupIds:
+        - !Ref w1PublicSG
+
+      # User data script to install and start Nginx
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          sudo yum install -y nginx
+          sudo systemctl start nginx
+          sudo systemctl enable nginx
+
+      Tags:
+        - Key: Name
+          Value: w1-public-ec2
+
+  # Private EC2 instance without direct internet access
+  w1PrivateEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      ImageId: ami-04dd8f0d80ed6323e
+      SubnetId: !Ref w1PrivateSubnet
+      SecurityGroupIds:
+        - !Ref w1PrivateSG
+      Tags:
+        - Key: Name
+          Value: w1-private-ec2
+
+Outputs:
+  # Outputs the VPC ID
+  w1VpcId:
+    Value: !Ref w1VPC
+
+  # Outputs the Public EC2 instance ID
+  w1PublicEC2Id:
+    Value: !Ref w1PublicEC2

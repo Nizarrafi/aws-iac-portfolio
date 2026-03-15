@@ -1,0 +1,630 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Final Book Catalog Architecture: ECR + 3-Layer Monitoring (CPU, Logs, Status Checks) + SNS Email Alerts."
+
+Parameters:
+  InstanceType:
+    Type: String
+    Description: "EC2 instance type"
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+  DBUsername:
+    Type: String
+    Description: "Username for RDS Database"
+    Default: postgres
+  DBPassword:
+    Type: String
+    Description: "Password for RDS Database (Minimum 8 chars)"
+    NoEcho: true
+    MinLength: 8
+  DBName:
+    Type: String
+    Description: "Custom DB name"
+    Default: bookcatalog
+  ECRImage:
+    Type: String
+    Description: "Your ECR Image URI (e.g., 123456789.dkr.ecr.us-east-1.amazonaws.com/bookcatalog:latest)"
+  AlertEmail:
+    Type: String
+    Description: "Email address for CloudWatch Alarms and Let's Encrypt SSL warnings"
+
+Resources:
+  # =================================================
+  # 1. VPC & NETWORKING (3-Tier)
+  # =================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Final-Monitoring-VPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnetApp:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.2.0/24
+
+  PrivateSubnetDB1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.3.0/24
+
+  PrivateSubnetDB2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.4.0/24
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Final-IGW
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachIGW
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetAppAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetApp
+      RouteTableId: !Ref PrivateRouteTable
+
+  # =================================================
+  # 2. SECURITY GROUPS (Nginx → App → RDS)
+  # =================================================
+  NginxSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS and SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow 3000 from Nginx
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref NginxSG
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  RDSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Postgres from App
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSG
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # =================================================
+  # 3. IAM ROLES & INSTANCE PROFILES (App → Nginx)
+  # =================================================
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Join ["", ["arn:aws:s3:::", !Ref AppBucket, "/*"]]
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppRole]
+
+  # Minimal Role for Public-Facing Nginx (Principle of Least Privilege)
+  NginxRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  NginxInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref NginxRole]
+
+  # =================================================
+  # 4. STORAGE: S3 BUCKET & VPC GATEWAY ENDPOINT
+  # =================================================
+  AppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      # Lifecycle: auto-delete old object versions after 30 days and cleanup delete markers
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldVersionsAndMarkers
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            ExpiredObjectDeleteMarker: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  AppBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AppBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Join ["", ["arn:aws:s3:::", !Ref AppBucket, "/*"]]
+
+  # S3 Gateway Endpoint: FREE - routes S3 traffic privately (no NAT cost for S3)
+  # Handles: AppServer uploading/downloading book images to/from S3
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  # =================================================
+  # 5. DATABASE (RDS PostgreSQL - Multi-AZ)
+  # =================================================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Multi-AZ Subnet Group
+      SubnetIds: [!Ref PrivateSubnetDB1, !Ref PrivateSubnetDB2]
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      EngineVersion: "15"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MultiAZ: true
+      VPCSecurityGroups: [!Ref RDSSG]
+      # Automated backup: 7-day retention, runs at 03:00-04:00 WIB (off-peak)
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "20:00-21:00"
+      DeleteAutomatedBackups: false
+
+  # =================================================
+  # 6. COMPUTE: NGINX (Public EC2 - User Data Bootstrapping)
+  # =================================================
+  NginxEIP:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+
+  NginxServer:
+    Type: AWS::EC2::Instance
+    DependsOn: AppServer
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0d5f3e23c61fbb3e8
+      IamInstanceProfile: !Ref NginxInstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref NginxSG]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Nginx-Proxy"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y nginx augeas-libs
+          systemctl enable --now nginx
+          setsebool -P httpd_can_network_connect 1 || true
+          # Get Public IP dan buat domain nip.io
+          PUBLIC_IP=$(curl -s ifconfig.me)
+          DOMAIN="${!PUBLIC_IP}.nip.io"
+          cat <<EOF > /etc/nginx/conf.d/app.conf
+          server {
+              listen 80;
+              server_name ${!DOMAIN};
+              location / {
+                  proxy_pass http://${AppServer.PrivateIp}:3000;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          EOF
+          systemctl restart nginx
+          python3 -m venv /opt/certbot/
+          /opt/certbot/bin/pip install --upgrade pip certbot certbot-nginx
+          ln -s /opt/certbot/bin/certbot /usr/bin/certbot
+          certbot --nginx -d ${!DOMAIN} --non-interactive --agree-tos -m ${AlertEmail}
+
+  NginxEIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      {
+        InstanceId: !Ref NginxServer,
+        AllocationId: !GetAtt NginxEIP.AllocationId,
+      }
+
+  # =================================================
+  # 7. COMPUTE: APP SERVER (Private EC2 - User Data Bootstrapping)
+  # =================================================
+  AppServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0d5f3e23c61fbb3e8
+      IamInstanceProfile: !Ref AppInstanceProfile
+      SubnetId: !Ref PrivateSubnetApp
+      SecurityGroupIds: [!Ref AppSG]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-App-Server"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y docker aws-cli
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          cat <<EOF > /home/ec2-user/.env
+          DB_HOST=${DBInstance.Endpoint.Address}
+          DB_USER=${DBUsername}
+          DB_PASSWORD=${DBPassword}
+          DB_NAME=${DBName}
+          AWS_BUCKET_NAME=${AppBucket}
+          AWS_REGION=${AWS::Region}
+          EOF
+          docker pull ${ECRImage}
+          sleep 10
+          docker run -d --name app \
+            --restart always \
+            --network host \
+            --env-file /home/ec2-user/.env \
+            --log-driver=awslogs \
+            --log-opt awslogs-group=${AppLogGroup} \
+            --log-opt awslogs-stream=app-logs \
+            --log-opt awslogs-region=${AWS::Region} \
+            ${ECRImage}
+
+  # =================================================
+  # 8. MONITORING & ALERTS
+  # =================================================
+
+  # CloudWatch Log Group (7-day retention)
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ec2/bookcatalog-${AWS::StackName}"
+      RetentionInDays: 7
+
+  # SNS Topic & Email Subscription
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "CloudWatch Alarms for BookCatalog"
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref AlertEmail
+      Protocol: email
+      TopicArn: !Ref AlarmNotificationTopic
+
+  # Layer 1: Log-based alarm - detects "Error" keyword
+  ErrorLogFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AppLogGroup
+      FilterPattern: "Error"
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricName: ErrorCount
+          MetricNamespace: WebAppMetrics
+          DefaultValue: 0
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ErrorAlarm"
+      AlarmDescription: "Level 1: Error Log Detected"
+      MetricName: ErrorCount
+      Namespace: WebAppMetrics
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # Layer 2: CPU utilization alarm - triggers above 80% for 5 minutes
+  CPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-CPUAlarm"
+      AlarmDescription: "Level 2: High CPU Utilization (>80%)"
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions: [{ Name: InstanceId, Value: !Ref AppServer }]
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # Layer 3: EC2 status check failure alarm
+  StatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-StatusCheckAlarm"
+      AlarmDescription: "Level 3: Server Down (Status Check Failed)"
+      MetricName: StatusCheckFailed
+      Namespace: AWS/EC2
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions: [{ Name: InstanceId, Value: !Ref AppServer }]
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # =================================================
+  # 9. ADDITIONAL ALARMS: RDS & NGINX
+  # =================================================
+
+  # RDS: Storage running low (< 2GB free)
+  RDSStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-RDSStorageAlarm"
+      AlarmDescription: "RDS: Free storage space below 2GB - risk of DB crash"
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2000000000
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # Nginx: Server down
+  NginxStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-NginxStatusCheckAlarm"
+      AlarmDescription: "Nginx: Server Down - all users cannot access the app"
+      MetricName: StatusCheckFailed
+      Namespace: AWS/EC2
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions: [{ Name: InstanceId, Value: !Ref NginxServer }]
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # CloudWatch Dashboard - Centralized Monitoring
+  AppDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "AppServer-Health-${AWS::StackName}"
+      DashboardBody: !Sub
+        - >
+          {
+            "widgets": [
+              {
+                "type": "metric",
+                "x": 0, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "AWS/EC2", "CPUUtilization", "InstanceId", "${AppInstanceId}" ]
+                  ],
+                  "period": 300,
+                  "stat": "Average",
+                  "region": "${Region}",
+                  "title": "App Server CPU (CPUAlarm)"
+                }
+              },
+              {
+                "type": "metric",
+                "x": 12, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "WebAppMetrics", "ErrorCount" ]
+                  ],
+                  "period": 60,
+                  "stat": "Sum",
+                  "view": "bar",
+                  "region": "${Region}",
+                  "title": "App Error Logs (ErrorAlarm)"
+                }
+              },
+              {
+                "type": "metric",
+                "x": 0, "y": 6, "width": 8, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "AWS/EC2", "StatusCheckFailed", "InstanceId", "${AppInstanceId}" ]
+                  ],
+                  "period": 60,
+                  "stat": "Maximum",
+                  "region": "${Region}",
+                  "title": "App Server Down (StatusCheckAlarm)"
+                }
+              },
+              {
+                "type": "metric",
+                "x": 8, "y": 6, "width": 8, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "AWS/EC2", "StatusCheckFailed", "InstanceId", "${NginxInstanceId}" ]
+                  ],
+                  "period": 60,
+                  "stat": "Maximum",
+                  "region": "${Region}",
+                  "title": "Nginx Server Down (NginxStatusCheckAlarm)"
+                }
+              },
+              {
+                "type": "metric",
+                "x": 16, "y": 6, "width": 8, "height": 6,
+                "properties": {
+                  "metrics": [
+                    [ "AWS/RDS", "FreeStorageSpace", "DBInstanceIdentifier", "${DBInstanceId}" ]
+                  ],
+                  "period": 300,
+                  "stat": "Minimum",
+                  "region": "${Region}",
+                  "title": "RDS Storage Sisa (RDSStorageAlarm)"
+                }
+              },
+              {
+                "type": "alarm",
+                "x": 0, "y": 12, "width": 24, "height": 6,
+                "properties": {
+                  "alarms": [
+                    "arn:aws:cloudwatch:${Region}:${AccountId}:alarm:${StackName}-ErrorAlarm",
+                    "arn:aws:cloudwatch:${Region}:${AccountId}:alarm:${StackName}-CPUAlarm",
+                    "arn:aws:cloudwatch:${Region}:${AccountId}:alarm:${StackName}-StatusCheckAlarm",
+                    "arn:aws:cloudwatch:${Region}:${AccountId}:alarm:${StackName}-RDSStorageAlarm",
+                    "arn:aws:cloudwatch:${Region}:${AccountId}:alarm:${StackName}-NginxStatusCheckAlarm"
+                  ],
+                  "title": "All Alarm Status"
+                }
+              }
+            ]
+          }
+        - AppInstanceId: !Ref AppServer
+          NginxInstanceId: !Ref NginxServer
+          DBInstanceId: !Ref DBInstance
+          Region: !Ref "AWS::Region"
+          AccountId: !Ref "AWS::AccountId"
+          StackName: !Ref "AWS::StackName"
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub "https://${NginxEIP.PublicIp}.nip.io"
+  SNSTopicArn:
+    Value: !Ref AlarmNotificationTopic
+    Description: "Please confirm your email address by clicking the verification link sent to your inbox."
